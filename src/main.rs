@@ -29,6 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 const BANK_SIZE: usize = 0x4000;
 const CHR_SIZE: usize = 0x2000;
 
+#[derive(Copy, Clone)]
+struct RomData {
+    banks_count: u8,
+    mapper: u8,
+}
+
 fn disassemble(filename: &str, cdl: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
     let data: Vec<u8> = fs::read(&cdl)?;
 
@@ -47,6 +53,7 @@ fn disassemble(filename: &str, cdl: &str, output: &str) -> Result<(), Box<dyn st
     let flags_06 = rom.read_u8()?;
     let mut padding = vec![0u8; 9];
     rom.read(&mut padding)?;
+    let mapper = flags_06 >> 4;
 
     fs::create_dir_all(output)?;
     let mut output_file = File::create(format!("{output}/main.s"))?;
@@ -92,6 +99,10 @@ fn disassemble(filename: &str, cdl: &str, output: &str) -> Result<(), Box<dyn st
     writeln!(output_file, ".RAMSECTION \"RAM\" SLOT 3")?;
     writeln!(output_file, ".ENDS\n")?;
 
+    let rom_data = RomData {
+        banks_count: prg_banks_count,
+        mapper,
+    };
     for id in 0..prg_banks_count {
         writeln!(output_file, ".INCLUDE \"bank{id:03}.asm\"")?;
 
@@ -102,7 +113,7 @@ fn disassemble(filename: &str, cdl: &str, output: &str) -> Result<(), Box<dyn st
         let cld_part = &data[bank_offset..bank_offset + BANK_SIZE];
         assert_eq!(cld_part.len(), BANK_SIZE);
 
-        disassemble_prg_bank(id, bank, cld_part, output)?;
+        disassemble_prg_bank(id, bank, rom_data, cld_part, output)?;
     }
 
     for id in 0..chr_banks_count {
@@ -121,6 +132,7 @@ fn disassemble(filename: &str, cdl: &str, output: &str) -> Result<(), Box<dyn st
 fn disassemble_prg_bank(
     id: u8,
     bank: Vec<u8>,
+    rom_data: RomData,
     cdl: &[u8],
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -131,8 +143,9 @@ fn disassemble_prg_bank(
     let mut labels = HashSet::new();
     let mut is_inside_data = false;
 
+    let bank_offset = get_bank_offset(id, rom_data.banks_count, rom_data.mapper);
     while i < bank.len() {
-        let g_offset = i + id as usize * 0x10000;
+        let g_offset = i + id as usize * 0x10000 + bank_offset;
 
         if (cdl[i] & 1) == 1 {
             // is code
@@ -153,7 +166,7 @@ fn disassemble_prg_bank(
                 }
 
                 let (size, output, target) =
-                    write_addressing(&opcode.addressing, &bank[(i + 1)..], g_offset)?;
+                    write_addressing(&opcode.addressing, &bank[(i + 1)..], id, g_offset, rom_data)?;
                 i += size;
 
                 if let Some(addr) = target {
@@ -213,15 +226,42 @@ fn disassemble_prg_bank(
     Ok(())
 }
 
+fn get_bank_offset(bank: u8, banks_count: u8, mapper: u8) -> usize {
+    match mapper {
+        10 => {
+            if bank == banks_count - 1 {
+                0xC000
+            } else {
+                0x8000
+            }
+        }
+        _ => {
+            println!("Unhandled mapper: {mapper}");
+            0x8000
+        }
+    }
+}
+
 fn write_addressing(
     addressing: &Addressing,
     bank: &[u8],
+    id: u8,
     position: usize,
+    rom_data: RomData,
 ) -> Result<(usize, String, Option<usize>), Box<dyn std::error::Error>> {
     Ok(match addressing {
-        Addressing::Absolute => (2, format!("${:02X}{:02X}", bank[1], bank[0]), None),
-        Addressing::AbsoluteX => (2, format!("${:02X}{:02X},X", bank[1], bank[0]), None),
-        Addressing::AbsoluteY => (2, format!("${:02X}{:02X},Y", bank[1], bank[0]), None),
+        Addressing::Absolute => {
+            let (label, target) = get_target(id, bank[0], bank[1], rom_data);
+            (2, label, Some(target))
+        }
+        Addressing::AbsoluteX => {
+            let (label, target) = get_target(id, bank[0], bank[1], rom_data);
+            (2, format!("{label},X"), Some(target))
+        }
+        Addressing::AbsoluteY => {
+            let (label, target) = get_target(id, bank[0], bank[1], rom_data);
+            (2, format!("{label},Y"), Some(target))
+        }
         Addressing::Accumulator => (0, "".into(), None),
         Addressing::Immediate => (1, format!("#{}", bank[0]), None),
         Addressing::Implied => (0, "".into(), None),
@@ -237,6 +277,24 @@ fn write_addressing(
         Addressing::ZeroPageX => (1, format!("${:02X},X", bank[0]), None),
         Addressing::ZeroPageY => (1, format!("${:02X},Y", bank[0]), None),
     })
+}
+
+fn get_target(id: u8, lo: u8, hi: u8, rom_data: RomData) -> (String, usize) {
+    let addr = ((hi as usize) << 8) + (lo as usize);
+
+    // check if RAM address
+    if addr < 0x0800 || (addr >= 0x6000 && addr < 0x8000) {
+        return (format!("${addr:04X}"), addr);
+    }
+
+    // MMC4 = last bank is fixed at $C000-FFFF
+    let target = if addr >= 0xC000 {
+        ((rom_data.banks_count - 1) as usize) << 16
+    } else {
+        (id as usize) << 16
+    } + addr;
+
+    (format!("L{target:06X}.w"), target)
 }
 
 enum Addressing {
